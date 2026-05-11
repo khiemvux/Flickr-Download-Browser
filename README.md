@@ -16,7 +16,7 @@ The app uses [`gallery-dl`](https://codeberg.org/mikf/gallery-dl) to read Flickr
 
 ## Quick Start
 
-Run:
+macOS/Linux:
 
 ```bash
 ./run.sh
@@ -24,7 +24,25 @@ Run:
 
 The script creates a local `.venv`, installs dependencies, starts a local server, and opens the app in your browser.
 
-Manual setup is also supported:
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python flickr_downloader_app.py
+```
+
+Windows Command Prompt:
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install -r requirements.txt
+python flickr_downloader_app.py
+```
+
+Manual setup on macOS/Linux is also supported:
 
 ```bash
 python3 -m venv .venv
@@ -32,6 +50,8 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python flickr_downloader_app.py
 ```
+
+After startup, the app opens a local browser page.
 
 ## How To Use
 
