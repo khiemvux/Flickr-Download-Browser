@@ -1,10 +1,30 @@
 # Flickr Photo Downloader
 
-A small Mac-first browser app for downloading public Flickr photos and saving each photo description as a matching `.txt` file.
+A small local browser app for downloading public Flickr photos in batches and saving each photo description as a matching `.txt` file.
 
-The app uses [`gallery-dl`](https://codeberg.org/mikf/gallery-dl) for Flickr extraction metadata. Flickr API credentials are not required for public content.
+The app uses [`gallery-dl`](https://codeberg.org/mikf/gallery-dl) to read Flickr metadata, then downloads the media files and writes description files locally. Flickr API credentials are not required for public content.
+
+## Features
+
+- Add multiple Flickr links to a queue
+- Download queued links one by one
+- Save each Flickr album or link into its own folder
+- Save every image with a matching `.txt` description file
+- Create an `about.txt` file for each album/link folder
+- Skip already downloaded files on later runs
+- Use slow, sequential downloads to reduce blocking risk
 
 ## Quick Start
+
+Run:
+
+```bash
+./run.sh
+```
+
+The script creates a local `.venv`, installs dependencies, starts a local server, and opens the app in your browser.
+
+Manual setup is also supported:
 
 ```bash
 python3 -m venv .venv
@@ -13,38 +33,36 @@ python -m pip install -r requirements.txt
 python flickr_downloader_app.py
 ```
 
-Or run:
+## How To Use
 
-```bash
-./run.sh
-```
+1. Paste a public Flickr URL.
+2. Choose a destination folder.
+3. Click **Add to Queue**.
+4. Add more links if needed.
+5. Click **Start Queue**.
 
-`run.sh` creates `.venv`, installs dependencies, starts a local server, and opens the app in your browser.
+Jobs run one by one. **Cancel Current** stops the active job and leaves pending jobs in the queue.
 
-## Batch Downloads
+## Output
 
-Paste a Flickr URL, choose a destination folder, and click **Add to Queue**. Add as many links as needed, then click **Start Queue**.
+Each Flickr album or link is saved inside its own subfolder under the destination folder.
 
-Jobs run one by one. **Cancel Current** stops the active job and leaves pending jobs in the queue so they can be started later.
-
-## What It Saves
-
-For each downloaded image:
-
-- `photo-name.jpg`
-- `photo-name.txt`
-
-The `.txt` file contains only the Flickr photo description when available. If no description is available, the app still creates an empty matching `.txt` file.
-
-Each Flickr album or link is saved inside its own subfolder under the destination folder. Album folders use:
+Album folders use this format:
 
 ```text
 Album title - Album ID
 ```
 
-Each folder also gets an `about.txt` file with the album/link title, source URL, and Flickr owner URL when available.
+For each downloaded image:
 
-Example:
+```text
+photo-name.jpg
+photo-name.txt
+```
+
+The `.txt` file contains only the Flickr photo description. If no description is available, an empty matching `.txt` file is still created.
+
+Each folder also gets an `about.txt` file:
 
 ```text
 Saigon markets
@@ -54,28 +72,13 @@ by TommyJapan1: https://www.flickr.com/photos/97930879@N02/
 
 ## Notes
 
-- Version 1 is for public Flickr URLs.
-- Downloads are intentionally paced slowly to reduce blocking risk.
-- Cancel is supported. True pause/resume is approximated by canceling and starting again; existing downloaded files are skipped on the next run.
-- Failed run details are appended to `flickr_downloader_errors.log` in the selected destination folder.
+- The app is designed for public Flickr URLs.
+- Downloads are intentionally sequential and paced slowly.
+- Existing completed image files are skipped, but matching `.txt` files are refreshed.
+- Failed download details are appended to `flickr_downloader_errors.log` in the relevant output folder.
 
 ## License And Credits
 
 This project is licensed under GPL-2.0-only.
 
-This project is not a fork of `gallery-dl`; it is a small browser app that depends on `gallery-dl` through `requirements.txt`. `gallery-dl` is developed by Mike Fährmann and contributors, hosted at <https://codeberg.org/mikf/gallery-dl>, and published under GPL-2.0-only.
-
-If this project later copies or modifies `gallery-dl` source code directly, treat that as derivative/fork-like work and keep the GPL obligations intact. This is engineering guidance, not legal advice.
-
-## Publishing To GitHub
-
-Create an empty GitHub repository in your browser, then run these commands from this folder:
-
-```bash
-git init
-git add .
-git commit -m "Initial Flickr downloader app"
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO.git
-git push -u origin main
-```
+This app uses [`gallery-dl`](https://codeberg.org/mikf/gallery-dl), developed by Mike Fährmann and contributors, published under GPL-2.0-only.
