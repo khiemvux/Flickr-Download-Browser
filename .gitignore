@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+.pycache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+flickr_downloader_errors.log
+Downloads/
+output/
+dist/
+build/
