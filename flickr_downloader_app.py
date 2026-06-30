@@ -10,6 +10,7 @@ import mimetypes
 import random
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -280,6 +281,13 @@ class AppState:
         self.cancel_event.set()
         self.log("Cancel requested. Current job will stop; pending jobs will stay in queue.")
 
+    def clear_queue(self) -> None:
+        with self.lock:
+            self.jobs = []
+            self.events = []
+            self.next_job_id = 1
+        self.log("Queue and log history cleared.")
+
     def pending_jobs(self) -> list[QueueJob]:
         with self.lock:
             return [job for job in self.jobs if job.status == STATUS_PENDING]
@@ -309,7 +317,22 @@ def download_file(item: DownloadItem, image_path: Path, cancel_event: threading.
     part_path = image_path.with_name(image_path.name + ".part")
     request = urllib.request.Request(item.media_url, headers={"User-Agent": "Mozilla/5.0 FlickrDownloader/1.0"})
 
-    with urllib.request.urlopen(request, timeout=45) as response, part_path.open("wb") as output:
+    try:
+        import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = ssl._create_unverified_context()
+
+    try:
+        response = urllib.request.urlopen(request, timeout=45, context=context)
+    except Exception:
+        if not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_NONE:
+            context = ssl._create_unverified_context()
+            response = urllib.request.urlopen(request, timeout=45, context=context)
+        else:
+            raise
+
+    with response, part_path.open("wb") as output:
         while True:
             if cancel_event.is_set():
                 raise RuntimeError("Download canceled")
@@ -541,13 +564,17 @@ HTML_PAGE = """<!doctype html>
         </div>
         <div class="row">
           <label for="destination">Save to folder</label>
-          <input id="destination">
+          <div style="display: flex; gap: 8px;">
+            <input id="destination" value="__DEFAULT_DESTINATION__" style="flex: 1;">
+            <button id="browse" style="min-height: 44px; white-space: nowrap;">Browse...</button>
+          </div>
         </div>
       </div>
       <div class="actions">
         <button id="add">Add to Queue</button>
         <button class="primary" id="start">Start Queue</button>
         <button id="cancel" disabled>Cancel Current</button>
+        <button id="clear" disabled>Clear Queue</button>
         <span id="status">Ready</span>
       </div>
     </section>
@@ -576,10 +603,11 @@ HTML_PAGE = """<!doctype html>
     const addButton = document.querySelector("#add");
     const startButton = document.querySelector("#start");
     const cancelButton = document.querySelector("#cancel");
+    const clearButton = document.querySelector("#clear");
+    const browseButton = document.querySelector("#browse");
     const statusText = document.querySelector("#status");
     const log = document.querySelector("#log");
     const jobsBody = document.querySelector("#jobs");
-    destinationInput.value = "__DEFAULT_DESTINATION__";
 
     function appendLog(message, type) {
       if (log.textContent === "Ready.") log.textContent = "";
@@ -597,6 +625,7 @@ HTML_PAGE = """<!doctype html>
       const running = Boolean(data.running);
       cancelButton.disabled = !running;
       startButton.disabled = running || !jobs.some(job => job.status === "Pending");
+      clearButton.disabled = running || !jobs.length;
       statusText.textContent = running ? "Running queue..." : "Ready";
       if (!jobs.length) {
         jobsBody.innerHTML = '<tr><td colspan="4">No jobs queued.</td></tr>';
@@ -630,6 +659,26 @@ HTML_PAGE = """<!doctype html>
     });
     startButton.addEventListener("click", async () => { await postJson("/api/start", {}); });
     cancelButton.addEventListener("click", async () => { await postJson("/api/cancel", {}); });
+    browseButton.addEventListener("click", async () => {
+      browseButton.disabled = true;
+      try {
+        const response = await fetch("/api/browse");
+        const data = await response.json();
+        if (data.ok && data.directory) {
+          destinationInput.value = data.directory;
+        }
+      } catch (err) {
+        console.error(err);
+      } finally {
+        browseButton.disabled = false;
+      }
+    });
+    clearButton.addEventListener("click", async () => {
+      if (confirm("Are you sure you want to clear the queue and log history?")) {
+        await postJson("/api/clear", {});
+        log.textContent = "Ready.";
+      }
+    });
 
     const events = new EventSource("/api/events");
     events.onmessage = async (event) => {
@@ -660,6 +709,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.stream_events()
         elif self.path == "/api/jobs":
             self.send_json({"jobs": STATE.snapshot(), "running": STATE.running})
+        elif self.path == "/api/browse":
+            self.browse_directory()
         else:
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -670,6 +721,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.start_queue()
         elif self.path == "/api/cancel":
             STATE.cancel()
+            self.send_json({"ok": True})
+        elif self.path == "/api/clear":
+            STATE.clear_queue()
             self.send_json({"ok": True})
         elif self.path == "/api/download":
             self.add_to_queue(start=True)
@@ -685,9 +739,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self.read_json()
             url = str(payload.get("url") or "").strip()
-            destination = Path(str(payload.get("destination") or "")).expanduser()
+            dest_str = str(payload.get("destination") or "").strip().strip("\u202a\u202b\u202c\u202d\u202e\u200e\u200f\ufeff")
+            destination = Path(dest_str).expanduser()
             if not is_probably_flickr_url(url):
                 self.send_json({"error": "Please paste a valid public Flickr URL."}, HTTPStatus.BAD_REQUEST)
+                return
+            if is_probably_flickr_url(dest_str):
+                self.send_json({"error": "Save folder cannot be a Flickr URL. Please swap the inputs."}, HTTPStatus.BAD_REQUEST)
                 return
             if not str(destination):
                 self.send_json({"error": "Please enter a save folder."}, HTTPStatus.BAD_REQUEST)
@@ -707,6 +765,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
         else:
             self.send_json({"error": "No pending jobs to start, or the queue is already running."}, HTTPStatus.CONFLICT)
+
+    def browse_directory(self) -> None:
+        try:
+            script = (
+                "import tkinter as tk\n"
+                "from tkinter import filedialog\n"
+                "root = tk.Tk()\n"
+                "root.withdraw()\n"
+                "root.attributes('-topmost', True)\n"
+                "print(filedialog.askdirectory(title='Select Destination Folder'), end='')\n"
+                "root.destroy()\n"
+            )
+            result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, check=True)
+            directory = result.stdout.strip()
+            self.send_json({"ok": True, "directory": directory})
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def stream_events(self) -> None:
         self.send_response(HTTPStatus.OK)
