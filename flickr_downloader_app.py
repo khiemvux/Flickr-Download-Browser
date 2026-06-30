@@ -38,6 +38,7 @@ STATUS_DONE = "Done"
 STATUS_FAILED = "Failed"
 STATUS_CANCELED = "Canceled"
 
+MAX_CACHE_ENTRIES = 500
 
 @dataclass
 class DownloadItem:
@@ -244,6 +245,33 @@ class AppState:
         self.running = False
         self.cancel_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self._metadata_cache: dict[str, ParsedDownload] = {}
+        self._cache_lock = threading.Lock()
+
+    def cache_get(self, url: str) -> Optional[ParsedDownload]:
+        with self._cache_lock:
+            return self._metadata_cache.get(url)
+
+    def cache_put(self, url: str, parsed: ParsedDownload) -> bool:
+        with self._cache_lock:
+            if len(self._metadata_cache) >= MAX_CACHE_ENTRIES:
+                self.log(f"Cache full ({MAX_CACHE_ENTRIES} entries). Not caching: {url}", EVENT_INFO)
+                return False
+            self._metadata_cache[url] = parsed
+            return True
+
+    def cache_clear(self) -> None:
+        with self._cache_lock:
+            count = len(self._metadata_cache)
+            self._metadata_cache.clear()
+        self.log(f"Cache cleared ({count} entries removed).")
+
+    def cache_stats(self) -> dict:
+        with self._cache_lock:
+            return {
+                "entries": len(self._metadata_cache),
+                "urls": list(self._metadata_cache.keys()),
+            }
 
     def log(self, message: str, event_type: str = EVENT_INFO) -> None:
         with self.condition:
@@ -363,8 +391,14 @@ def run_one_job(state: AppState, job: QueueJob) -> None:
     job.error = ""
     prefix = f"Job #{job.id}"
     try:
-        state.log(f"{prefix}: reading Flickr metadata.")
-        parsed = collect_flickr_items(job.url)
+        cached = state.cache_get(job.url)
+        if cached is not None:
+            parsed = cached
+            state.log(f"{prefix}: using cached metadata for {job.url} (cache has {state.cache_stats()['entries']} entries)")
+        else:
+            state.log(f"{prefix}: reading Flickr metadata.")
+            parsed = collect_flickr_items(job.url)
+            state.cache_put(job.url, parsed)
         if not parsed.items:
             raise RuntimeError("No downloadable public media URL was found.")
 
@@ -496,7 +530,7 @@ HTML_PAGE = """<!doctype html>
       margin-bottom: 16px;
     }
     label { display: block; margin: 0 0 7px; font-weight: 650; }
-    input {
+    input, textarea {
       width: 100%;
       min-height: 44px;
       padding: 10px 12px;
@@ -559,8 +593,8 @@ HTML_PAGE = """<!doctype html>
     <section class="panel">
       <div class="grid">
         <div class="row">
-          <label for="url">Flickr URL</label>
-          <input id="url" placeholder="https://www.flickr.com/photos/...">
+          <label for="url">Flickr URLs (one per line)</label>
+          <textarea id="url" rows="4" placeholder="https://www.flickr.com/photos/...&#10;https://www.flickr.com/photos/...&#10;https://www.flickr.com/photos/..."></textarea>
         </div>
         <div class="row">
           <label for="destination">Save to folder</label>
@@ -571,10 +605,12 @@ HTML_PAGE = """<!doctype html>
         </div>
       </div>
       <div class="actions">
-        <button id="add">Add to Queue</button>
+        <button id="add">Import Bulk Links</button>
         <button class="primary" id="start">Start Queue</button>
         <button id="cancel" disabled>Cancel Current</button>
         <button id="clear" disabled>Clear Queue</button>
+        <button id="clearcache" style="margin-left: 12px;" title="Clear in-memory metadata cache">Clear Cache</button>
+        <span id="cacheinfo" style="margin-left: 8px; color: var(--muted); font-size: 14px;">Cache: ? entries</span>
         <span id="status">Ready</span>
       </div>
     </section>
@@ -604,10 +640,22 @@ HTML_PAGE = """<!doctype html>
     const startButton = document.querySelector("#start");
     const cancelButton = document.querySelector("#cancel");
     const clearButton = document.querySelector("#clear");
+    const clearcacheButton = document.querySelector("#clearcache");
+    const cacheInfo = document.querySelector("#cacheinfo");
     const browseButton = document.querySelector("#browse");
     const statusText = document.querySelector("#status");
     const log = document.querySelector("#log");
     const jobsBody = document.querySelector("#jobs");
+
+    async function refreshCacheStats() {
+      try {
+        const response = await fetch("/api/cache");
+        const data = await response.json();
+        cacheInfo.textContent = `Cache: ${data.entries} entries`;
+      } catch (err) {
+        console.error(err);
+      }
+    }
 
     function appendLog(message, type) {
       if (log.textContent === "Ready.") log.textContent = "";
@@ -629,16 +677,17 @@ HTML_PAGE = """<!doctype html>
       statusText.textContent = running ? "Running queue..." : "Ready";
       if (!jobs.length) {
         jobsBody.innerHTML = '<tr><td colspan="4">No jobs queued.</td></tr>';
-        return;
+      } else {
+        jobsBody.innerHTML = jobs.map(job => `
+          <tr>
+            <td>#${job.id}</td>
+            <td class="job-url">${job.url}${job.folder ? `<br><small>${job.folder}</small>` : ""}</td>
+            <td class="${job.status}">${job.status}</td>
+            <td>${job.completed}/${job.total || "?"}${job.failed ? `, ${job.failed} failed` : ""}</td>
+          </tr>
+        `).join("");
       }
-      jobsBody.innerHTML = jobs.map(job => `
-        <tr>
-          <td>#${job.id}</td>
-          <td class="job-url">${job.url}${job.folder ? `<br><small>${job.folder}</small>` : ""}</td>
-          <td class="${job.status}">${job.status}</td>
-          <td>${job.completed}/${job.total || "?"}${job.failed ? `, ${job.failed} failed` : ""}</td>
-        </tr>
-      `).join("");
+      await refreshCacheStats();
     }
 
     async function postJson(url, payload) {
@@ -654,8 +703,30 @@ HTML_PAGE = """<!doctype html>
     }
 
     addButton.addEventListener("click", async () => {
-      const ok = await postJson("/api/queue", {url: urlInput.value, destination: destinationInput.value});
-      if (ok) urlInput.value = "";
+      const raw = urlInput.value.trim();
+      if (!raw) {
+        appendLog("Please paste one or more Flickr URLs (one per line).", "error");
+        return;
+      }
+      const urls = raw.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+      appendLog(`Importing ${urls.length} link(s)...`, "info");
+      const response = await fetch("/api/queue-bulk", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({urls: urls, destination: destinationInput.value})
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        appendLog(data.error || "Bulk import failed.", "error");
+        await refreshJobs();
+        return;
+      }
+      appendLog(`Bulk import result: ${data.queued} queued, ${data.rejected} rejected out of ${data.total} link(s).`, data.rejected ? "error" : "info");
+      if (data.errors && data.errors.length) {
+        data.errors.forEach(err => appendLog(`Rejected: ${err}`, "error"));
+      }
+      urlInput.value = "";
+      await refreshJobs();
     });
     startButton.addEventListener("click", async () => { await postJson("/api/start", {}); });
     cancelButton.addEventListener("click", async () => { await postJson("/api/cancel", {}); });
@@ -677,6 +748,16 @@ HTML_PAGE = """<!doctype html>
       if (confirm("Are you sure you want to clear the queue and log history?")) {
         await postJson("/api/clear", {});
         log.textContent = "Ready.";
+      }
+    });
+    clearcacheButton.addEventListener("click", async () => {
+      const response = await fetch("/api/cache/clear", { method: "POST" });
+      const data = await response.json();
+      if (data.ok) {
+        appendLog(data.message || "Cache cleared.", "info");
+        await refreshCacheStats();
+      } else {
+        appendLog(data.error || "Failed to clear cache.", "error");
       }
     });
 
@@ -711,12 +792,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_json({"jobs": STATE.snapshot(), "running": STATE.running})
         elif self.path == "/api/browse":
             self.browse_directory()
+        elif self.path == "/api/cache":
+            self.send_json(STATE.cache_stats())
         else:
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         if self.path == "/api/queue":
             self.add_to_queue()
+        elif self.path == "/api/queue-bulk":
+            self.add_bulk_to_queue()
         elif self.path == "/api/start":
             self.start_queue()
         elif self.path == "/api/cancel":
@@ -725,6 +810,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/clear":
             STATE.clear_queue()
             self.send_json({"ok": True})
+        elif self.path == "/api/cache/clear":
+            STATE.cache_clear()
+            self.send_json({"ok": True, "message": "Cache cleared"})
         elif self.path == "/api/download":
             self.add_to_queue(start=True)
         else:
@@ -757,6 +845,53 @@ class RequestHandler(BaseHTTPRequestHandler):
             if start:
                 STATE.start_queue()
             self.send_json({"ok": True, "job": job.to_dict()})
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def add_bulk_to_queue(self) -> None:
+        try:
+            payload = self.read_json()
+            urls = payload.get("urls") or []
+            dest_str = str(payload.get("destination") or "").strip().strip("\u202a\u202b\u202c\u202d\u202e\u200e\u200f\ufeff")
+            if not urls:
+                self.send_json({"error": "No URLs provided."}, HTTPStatus.BAD_REQUEST)
+                return
+            if not dest_str:
+                self.send_json({"error": "Please enter a save folder."}, HTTPStatus.BAD_REQUEST)
+                return
+            destination = Path(dest_str).expanduser()
+            gallery_ok = gallery_dl_module_available()
+            total = len(urls)
+            queued = 0
+            rejected = 0
+            errors: list[str] = []
+            for url in urls:
+                url = str(url).strip()
+                if not url:
+                    rejected += 1
+                    errors.append("empty URL")
+                    continue
+                if not is_probably_flickr_url(url):
+                    rejected += 1
+                    errors.append(f"not a Flickr URL: {url}")
+                    continue
+                if not gallery_ok:
+                    rejected += 1
+                    errors.append(f"gallery-dl not available: {url}")
+                    continue
+                try:
+                    STATE.add_job(url, destination)
+                    queued += 1
+                except Exception as exc:
+                    rejected += 1
+                    errors.append(f"failed to queue {url}: {exc}")
+            self.send_json({
+                "ok": True,
+                "total": total,
+                "queued": queued,
+                "rejected": rejected,
+                "errors": errors,
+            })
         except Exception as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
